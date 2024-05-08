@@ -60,6 +60,7 @@ pub struct InputMapper {
     /// The most recent candidate for a tap function is held here
     tapping: Option<KeyCode>,
 
+    // outputed keys
     output_keys: HashSet<KeyCode>,
 }
 
@@ -74,6 +75,8 @@ impl InputMapper {
     pub fn create_mapper<P: AsRef<Path>>(path: P, mappings: Vec<Mapping>) -> Result<Self> {
         let path = path.as_ref();
         let f = std::fs::File::open(path).context(format!("opening {}", path.display()))?;
+
+        // create a virtual input device
         let mut input = Device::new_from_file(f)
             .with_context(|| format!("failed to create new Device from file {}", path.display()))?;
 
@@ -98,9 +101,29 @@ impl InputMapper {
             }
         }
 
+        /**
+          In the context of the provided code, `UInput` refers to the User Input subsystem in Linux.
+          It is a kernel module that allows user-space programs to create virtual input devices, such as keyboards, mice, and gamepads.
+
+          The "U" in `UInput` stands for "User". It signifies that the virtual input devices created using the `UInput` module
+          are controlled by user-space programs rather than being directly connected to physical hardware.
+          By using the `UInput` module, you can create virtual input devices and simulate input events programmatically.
+          This can be useful in various scenarios, such as automated testing, virtual reality applications,
+           or creating custom input devices.
+         */
         let output = UInputDevice::create_from_device(&input)
             .context(format!("creating UInputDevice from {}", path.display()))?;
 
+        /**
+         * Grab or ungrab the device through a kernel EVIOCGRAB.
+         * This prevents other clients (including kernel-internal ones such as rfkill) from receiving events from this device.
+         * This is generally a bad idea. Don't do this. Grabbing an already grabbed device,
+         * or ungrabbing an ungrabbed device is a noop and always succeeds.
+         *
+         * A grab is an operation tied to a file descriptor, not a device. If a client changes the file descriptor with Device::change_file(),
+         * it must also re-issue a grab with libevdev_grab().
+            */
+        // Grab 会排他访问，如果有第二个访问同一个 input device 的进程运行到这里，就会 grab 失败，并报错(context里的错误)
         input
             .grab(GrabMode::Grab)
             .context(format!("grabbing exclusive access on {}", path.display()))?;
@@ -124,14 +147,17 @@ impl InputMapper {
             match status {
                 evdev_rs::ReadStatus::Success => {
                     if let EventCode::EV_KEY(ref key) = event.event_code {
-                        log::trace!("IN {:?}", event);
+                        log::info!("Eventloop read a key, IN: {:?}, call update_with_event", event);
                         self.update_with_event(&event, key.clone())?;
                     } else {
-                        log::trace!("PASSTHRU {:?}", event);
+                        log::info!("Eventloop read not key, PASSTHRU: {:?}", event);
                         self.output.write_event(&event)?;
                     }
                 }
-                evdev_rs::ReadStatus::Sync => bail!("ReadStatus::Sync!"),
+
+                // ref: https://www.freedesktop.org/software/libevdev/doc/latest/group__events.html#gabb96c864e836c0b98788f4ab771c3a76
+                // ref2: https://gitlab.freedesktop.org/libevdev/libevdev/blob/master/tools/libevdev-events.c#L159
+                evdev_rs::ReadStatus::Sync => bail!("Eventloop error: ReadStatus::Sync!"),
             }
         }
     }
@@ -231,7 +257,7 @@ impl InputMapper {
     }
 
     fn lookup_mapping(&self, code: KeyCode) -> Option<Mapping> {
-        let mut candidates = vec![];
+        let mut candidates = vec![]; // the ! symbol following a word indicates that it's a macro, not a regular function.!
 
         for map in &self.mappings {
             match map {
@@ -266,12 +292,21 @@ impl InputMapper {
         // Any matches must be Remap entries.  We want the one
         // with the most active keys
         candidates.sort_by(|a, b| match (a, b) {
+            /**
+             * The comparator function in this case is a closure that uses pattern matching to destructure the Mapping::Remap enum variant.
+             * If both a and b are of this variant, it compares the lengths of input_a and input_b using the cmp method.
+             * The cmp method returns an Ordering that indicates whether input_a.len() is less than, equal to, or greater than input_b.len().
+             *
+             * The reverse method is then called to reverse the Ordering, meaning that the candidates vector will be sorted
+             * in descending order of the lengths of input_a and input_b.
+             */
             (Mapping::Remap { input: input_a, .. }, Mapping::Remap { input: input_b, .. }) => {
                 input_a.len().cmp(&input_b.len()).reverse()
             }
             _ => unreachable!(),
         });
 
+        // 只匹配第一个
         candidates.get(0).map(|&m| m.clone())
     }
 
@@ -279,7 +314,9 @@ impl InputMapper {
         let event_type = KeyEventType::from_value(event.value);
         match event_type {
             KeyEventType::Release => {
-                let pressed_at = match self.input_state.remove(&code) {
+                log::info!("update_with_event release remap {:?}", code);
+                //
+                let pressed_at: TimeVal = match self.input_state.remove(&code) {
                     None => {
                         self.write_event_and_sync(event)?;
                         return Ok(());
@@ -308,10 +345,12 @@ impl InputMapper {
 
                 match self.lookup_mapping(code.clone()) {
                     Some(_) => {
+                        log::error!("update_with_event press remap {:?}", code);
                         self.compute_and_apply_keys(&event.time)?;
                         self.tapping.replace(code);
                     }
                     None => {
+                        log::error!("update_with_event press passthrough {:?}", code);
                         // Just pass it through
                         self.cancel_pending_tap();
                         self.compute_and_apply_keys(&event.time)?;
@@ -321,13 +360,17 @@ impl InputMapper {
             KeyEventType::Repeat => {
                 match self.lookup_mapping(code.clone()) {
                     Some(Mapping::DualRole { hold, .. }) => {
+                        log::error!("update_with_event repeat dual hold {:?} => {:?}", code, hold);
                         self.emit_keys(&hold, &event.time, KeyEventType::Repeat)?;
                     }
                     Some(Mapping::Remap { output, .. }) => {
                         let output: Vec<KeyCode> = output.iter().cloned().collect();
+                        //log
+                        log::error!("update_with_event repeat remap {:?} => {:?}", code, output);
                         self.emit_keys(&output, &event.time, KeyEventType::Repeat)?;
                     }
                     None => {
+                        log::info!("update_with_eventr epeat pass hold {:?}", code);
                         // Just pass it through
                         self.cancel_pending_tap();
                         self.write_event_and_sync(event)?;
@@ -335,6 +378,7 @@ impl InputMapper {
                 }
             }
             KeyEventType::Unknown(_) => {
+                log::info!("update_with_event repeat unknown {:?}", code);
                 self.write_event_and_sync(event)?;
             }
         }
@@ -367,7 +411,7 @@ impl InputMapper {
     }
 
     fn write_event(&mut self, event: &InputEvent) -> Result<()> {
-        log::trace!("OUT: {:?}", event);
+        log::info!("OUT: {:?}", event);
         self.output.write_event(&event)?;
         if let EventCode::EV_KEY(ref key) = event.event_code {
             let event_type = KeyEventType::from_value(event.value);

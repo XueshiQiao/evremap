@@ -66,6 +66,11 @@ fn setup_logger() {
 
 fn main() -> Result<()> {
     setup_logger();
+    // simulate the command line arguments 'remap /path/to/config.json'
+    // let opt = Opt::Remap {
+    //     config_file: PathBuf::from("/home/joey/.evremap.conf"),
+    //     delay: 0.1,
+    // };
     let opt = Opt::parse();
 
     match opt {
