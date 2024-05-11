@@ -166,6 +166,7 @@ impl InputMapper {
     fn compute_keys(&self) -> HashSet<KeyCode> {
         // Start with the input keys
         let mut keys: HashSet<KeyCode> = self.input_state.keys().cloned().collect();
+        let keys_input_original = keys.clone();
 
         // First phase is to apply any DualRole mappings as they are likely to
         // be used to produce modifiers when held.
@@ -203,7 +204,7 @@ impl InputMapper {
                 }
             }
         }
-
+        log::info!("compute_keys: {:?} => {:?}", keys_input_original, keys);
         keys
     }
 
@@ -231,6 +232,8 @@ impl InputMapper {
             .difference(&self.output_keys)
             .cloned()
             .collect();
+        log::info!("compute_and_apply_keys: desired_keys: {:?}, output_keys: {:?}, to_release: {:?}, to_press: {:?}",
+            desired_keys, self.output_keys, to_release, to_press);
 
         if !to_release.is_empty() {
             to_release.sort_by(modifiers_last);
@@ -316,6 +319,7 @@ impl InputMapper {
             KeyEventType::Release => {
                 log::info!("update_with_event release remap {:?}", code);
                 //
+                log::info!("update_with_event try to remove {:?} from input_state: {:?}", code, self.input_state);
                 let pressed_at: TimeVal = match self.input_state.remove(&code) {
                     None => {
                         self.write_event_and_sync(event)?;
@@ -341,6 +345,7 @@ impl InputMapper {
                 }
             }
             KeyEventType::Press => {
+                log::info!("update_with_event add {:?} to input_state: {:?}", code, self.input_state);
                 self.input_state.insert(code.clone(), event.time.clone());
 
                 match self.lookup_mapping(code.clone()) {
@@ -417,9 +422,11 @@ impl InputMapper {
             let event_type = KeyEventType::from_value(event.value);
             match event_type {
                 KeyEventType::Press | KeyEventType::Repeat => {
+                    log::info!("write_event press/repeat:  add {:?} to output_keys: {:?}", key, self.output_keys);
                     self.output_keys.insert(key.clone());
                 }
                 KeyEventType::Release => {
+                    log::info!("write_event release: remove {:?} from output_keys: {:?}", key, self.output_keys);
                     self.output_keys.remove(key);
                 }
                 _ => {}
